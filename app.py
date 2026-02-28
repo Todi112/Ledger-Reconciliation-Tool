@@ -1,6 +1,6 @@
 import io
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,6 +10,7 @@ REQUIRED_COLUMNS = [
     "customer",
     "product",
     "geography",
+    "industry",
     "base_annual_sales",
     "base_gross_margin_pct",
 ]
@@ -29,6 +30,39 @@ MONTHS = [
     "Dec",
 ]
 
+INDUSTRY_BENCHMARKS = {
+    "FMCG": {
+        "growth_hint_pct": 6.0,
+        "price_hint_pct": 2.0,
+        "margin_hint_pct": 24.0,
+        "note": "Push distribution expansion and promo ROI tracking.",
+    },
+    "Pharma": {
+        "growth_hint_pct": 8.0,
+        "price_hint_pct": 3.0,
+        "margin_hint_pct": 33.0,
+        "note": "Focus on key account coverage and channel fill-rates.",
+    },
+    "Industrial": {
+        "growth_hint_pct": 5.0,
+        "price_hint_pct": 2.5,
+        "margin_hint_pct": 28.0,
+        "note": "Use deal-level pipeline confidence and contract renewal plans.",
+    },
+    "Retail": {
+        "growth_hint_pct": 7.0,
+        "price_hint_pct": 1.5,
+        "margin_hint_pct": 22.0,
+        "note": "Watch assortment productivity and regional sell-through.",
+    },
+    "Technology": {
+        "growth_hint_pct": 10.0,
+        "price_hint_pct": 1.0,
+        "margin_hint_pct": 36.0,
+        "note": "Prioritize upsell/cross-sell motions in existing customers.",
+    },
+}
+
 
 @dataclass
 class PlanAssumptions:
@@ -42,11 +76,11 @@ class PlanAssumptions:
 
 SAMPLE_DATA = pd.DataFrame(
     [
-        ["Acme Retail", "Widget A", "North", 120_000, 32],
-        ["Acme Retail", "Widget B", "North", 80_000, 28],
-        ["Bravo Distributors", "Widget A", "West", 95_000, 30],
-        ["Central Stores", "Widget C", "East", 140_000, 35],
-        ["Delta Wholesale", "Widget B", "South", 110_000, 27],
+        ["Acme Retail", "Widget A", "North", "Retail", 120_000, 32],
+        ["Acme Retail", "Widget B", "North", "Retail", 80_000, 28],
+        ["Bravo Distributors", "Widget A", "West", "FMCG", 95_000, 30],
+        ["Central Stores", "Widget C", "East", "Industrial", 140_000, 35],
+        ["Delta Wholesale", "Widget B", "South", "Pharma", 110_000, 27],
     ],
     columns=REQUIRED_COLUMNS,
 )
@@ -69,6 +103,10 @@ def validate_input(df: pd.DataFrame) -> List[str]:
         if ((df["base_gross_margin_pct"] < 0) | (df["base_gross_margin_pct"] > 100)).any():
             errors.append("'base_gross_margin_pct' must be between 0 and 100")
 
+        for text_col in ["customer", "product", "geography", "industry"]:
+            if df[text_col].astype(str).str.strip().eq("").any():
+                errors.append(f"Column '{text_col}' cannot be blank")
+
     return errors
 
 
@@ -79,6 +117,17 @@ def normalize_seasonality(raw_weights: Dict[str, float]) -> Dict[str, float]:
     else:
         weights = weights / weights.sum()
     return {m: float(w) for m, w in zip(MONTHS, weights)}
+
+
+def normalize_team_split(team_split: pd.DataFrame) -> pd.DataFrame:
+    clean = team_split.copy()
+    clean["allocation_pct"] = clean["allocation_pct"].clip(lower=0)
+    total = clean["allocation_pct"].sum()
+    if np.isclose(total, 0):
+        clean["allocation_pct"] = 100 / len(clean)
+    else:
+        clean["allocation_pct"] = (clean["allocation_pct"] / total) * 100
+    return clean
 
 
 def build_plan(df: pd.DataFrame, assumptions: PlanAssumptions) -> pd.DataFrame:
@@ -101,6 +150,7 @@ def build_plan(df: pd.DataFrame, assumptions: PlanAssumptions) -> pd.DataFrame:
                     "customer": row["customer"],
                     "product": row["product"],
                     "geography": row["geography"],
+                    "industry": row["industry"],
                     "planned_sales": round(monthly_sales, 2),
                     "gross_margin_pct": margin_pct,
                     "gross_margin_value": round(gross_margin_value, 2),
@@ -108,6 +158,17 @@ def build_plan(df: pd.DataFrame, assumptions: PlanAssumptions) -> pd.DataFrame:
             )
 
     return pd.DataFrame(rows)
+
+
+def apply_sales_team_split(detail_df: pd.DataFrame, team_split: pd.DataFrame) -> pd.DataFrame:
+    normalized_split = normalize_team_split(team_split)
+    detail_df = detail_df.assign(_key=1)
+    normalized_split = normalized_split.assign(_key=1)
+
+    team_df = detail_df.merge(normalized_split, on="_key", how="inner").drop(columns=["_key"])
+    team_df["planned_sales"] = (team_df["planned_sales"] * team_df["allocation_pct"] / 100).round(2)
+    team_df["gross_margin_value"] = (team_df["gross_margin_value"] * team_df["allocation_pct"] / 100).round(2)
+    return team_df
 
 
 def summarize(plan_df: pd.DataFrame, group_by: str) -> pd.DataFrame:
@@ -121,19 +182,62 @@ def summarize(plan_df: pd.DataFrame, group_by: str) -> pd.DataFrame:
     )
 
 
+def get_industry_insights(input_df: pd.DataFrame, assumptions: PlanAssumptions) -> pd.DataFrame:
+    insights = []
+    for industry in sorted(input_df["industry"].dropna().astype(str).str.strip().unique()):
+        benchmark = INDUSTRY_BENCHMARKS.get(industry)
+        if benchmark:
+            benchmark_growth = benchmark["growth_hint_pct"]
+            gap = assumptions.growth_pct - benchmark_growth
+            advice = (
+                "Planned growth is above benchmark; validate pipeline coverage and capacity."
+                if gap > 1
+                else "Planned growth is below benchmark; consider additional demand generation."
+                if gap < -1
+                else "Planned growth is aligned with benchmark."
+            )
+            insights.append(
+                {
+                    "industry": industry,
+                    "benchmark_growth_pct": benchmark_growth,
+                    "benchmark_margin_pct": benchmark["margin_hint_pct"],
+                    "planning_note": f"{advice} {benchmark['note']}",
+                }
+            )
+        else:
+            insights.append(
+                {
+                    "industry": industry,
+                    "benchmark_growth_pct": np.nan,
+                    "benchmark_margin_pct": np.nan,
+                    "planning_note": "No benchmark configured. Use recent trend + sales team judgment.",
+                }
+            )
+
+    return pd.DataFrame(insights)
+
+
 def to_excel_bytes(
     detail_df: pd.DataFrame,
+    team_df: pd.DataFrame,
     product_df: pd.DataFrame,
     geography_df: pd.DataFrame,
     customer_df: pd.DataFrame,
+    industry_df: pd.DataFrame,
+    team_summary_df: pd.DataFrame,
+    insights_df: pd.DataFrame,
     assumptions: PlanAssumptions,
 ) -> bytes:
     output = io.BytesIO()
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         detail_df.to_excel(writer, sheet_name="SalesPlan_Detail", index=False)
+        team_df.to_excel(writer, sheet_name="SalesPlan_ByTeam", index=False)
         product_df.to_excel(writer, sheet_name="Summary_Product", index=False)
         geography_df.to_excel(writer, sheet_name="Summary_Geography", index=False)
         customer_df.to_excel(writer, sheet_name="Summary_Customer", index=False)
+        industry_df.to_excel(writer, sheet_name="Summary_Industry", index=False)
+        team_summary_df.to_excel(writer, sheet_name="Summary_SalesTeam", index=False)
+        insights_df.to_excel(writer, sheet_name="Industry_Insights", index=False)
 
         assumptions_df = pd.DataFrame(
             {
@@ -159,10 +263,32 @@ def to_excel_bytes(
     return output.getvalue()
 
 
+def capture_team_split() -> pd.DataFrame:
+    st.subheader("Sales team split")
+    st.caption("Allocate the total plan across sales teams. Percentages are normalized automatically.")
+
+    team_count = st.number_input("Number of sales teams", min_value=1, max_value=10, value=3, step=1)
+    default_teams = ["National Key Accounts", "Regional Field", "Inside Sales", "Distributor Team"]
+
+    rows: List[Tuple[str, float]] = []
+    for i in range(int(team_count)):
+        c1, c2 = st.columns([3, 1])
+        team_name = c1.text_input(f"Team {i + 1} name", value=default_teams[i] if i < len(default_teams) else f"Team {i + 1}")
+        team_alloc = c2.number_input(f"Team {i + 1} %", min_value=0.0, max_value=100.0, value=round(100 / team_count, 2), step=0.5)
+        rows.append((team_name.strip() or f"Team {i + 1}", float(team_alloc)))
+
+    split_df = pd.DataFrame(rows, columns=["sales_team", "allocation_pct"])
+    split_df = normalize_team_split(split_df)
+    st.dataframe(split_df, use_container_width=True)
+    return split_df
+
+
 def main() -> None:
     st.set_page_config(page_title="AOP Sales Planner", layout="wide")
     st.title("Annual Operating Plan (AOP) Sales Planner")
-    st.caption("Build a product-wise, geography-wise, and customer-wise annual sales plan and export it to Excel.")
+    st.caption(
+        "Build product-wise, geography-wise, customer-wise and sales-team-wise plans with industry insights, then export to Excel."
+    )
 
     with st.sidebar:
         st.header("Plan assumptions")
@@ -207,15 +333,28 @@ def main() -> None:
             st.error(err)
         st.stop()
 
+    team_split_df = capture_team_split()
+
     detail_df = build_plan(input_df, assumptions)
+    team_df = apply_sales_team_split(detail_df, team_split_df)
+
     product_df = summarize(detail_df, "product")
     geography_df = summarize(detail_df, "geography")
     customer_df = summarize(detail_df, "customer")
+    industry_df = summarize(detail_df, "industry")
+    team_summary_df = summarize(team_df, "sales_team")
+    insights_df = get_industry_insights(input_df, assumptions)
 
     col1, col2, col3 = st.columns(3)
     col1.metric(f"Total plan sales ({assumptions.currency})", f"{detail_df['planned_sales'].sum():,.0f}")
     col2.metric(f"Total gross margin ({assumptions.currency})", f"{detail_df['gross_margin_value'].sum():,.0f}")
     col3.metric("Planned combinations", f"{input_df.shape[0]:,}")
+
+    st.subheader("Industry insights for plan tailoring")
+    st.dataframe(insights_df, use_container_width=True)
+
+    st.subheader("Sales team annual split")
+    st.dataframe(team_summary_df, use_container_width=True)
 
     st.subheader("Product summary")
     st.dataframe(product_df, use_container_width=True)
@@ -226,7 +365,20 @@ def main() -> None:
     st.subheader("Customer summary")
     st.dataframe(customer_df, use_container_width=True)
 
-    excel_data = to_excel_bytes(detail_df, product_df, geography_df, customer_df, assumptions)
+    st.subheader("Industry summary")
+    st.dataframe(industry_df, use_container_width=True)
+
+    excel_data = to_excel_bytes(
+        detail_df,
+        team_df,
+        product_df,
+        geography_df,
+        customer_df,
+        industry_df,
+        team_summary_df,
+        insights_df,
+        assumptions,
+    )
     st.download_button(
         label="Download AOP Excel workbook",
         data=excel_data,
